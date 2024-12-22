@@ -1,4 +1,4 @@
-use core::{ffi::c_void, ptr::read_unaligned};
+use core::ffi::c_void;
 
 use crate::types::{BuildThreshold, WinVer, WIN32_WIN_NT_VISTA, WIN32_WIN_NT_WIN10, WIN32_WIN_NT_WIN7, WIN32_WIN_NT_WIN8, WIN32_WIN_NT_WINBLUE, WIN32_WIN_NT_WINXP};
 

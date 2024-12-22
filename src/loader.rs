@@ -667,16 +667,20 @@ unsafe fn search_ldrp_handle_tls(
     if IsWindows11BetaOrGreater(win_ver) {
         return find_ldrp_handle_tls_greator_win11(module_base) as _;
     }
-    let (pattern, offset) = get_ldrp_handle_tls_offset_data(win_ver);
-    if pattern.is_empty() || offset.eq(&0) {
-        return  null();
+    let handle = get_ldrp_handle_tls_offset_data(win_ver);
+    if handle.offset.eq(&0) {
+        return null();
     }
     let (section, size) = get_text_range(module_base);
     if section.is_null() || size.eq(&0) {
         return null();
     }
-    let end = pointer_add(section, size);
-    search(section, end, pattern)
+    let offset = boyer_moore(section as _, size, &handle.pattern, handle.real_len);
+    if offset.eq(&-1) {
+        return null();
+    }
+    let addr = (offset as usize + section as usize) as *const core::ffi::c_void;
+    return pointer_sub(addr, handle.offset);
 }
 
 #[no_mangle]
@@ -705,8 +709,6 @@ pub unsafe fn find_ldrp_handle_tls_greator_win11(
     let call_drp_log_internal_addr = call_drp_log_internal_addr as usize + xref_addr as usize;
     let call_ldr_allocate_tls_entry = boyer_moore(
         (call_drp_log_internal_addr + 5) as _, 0x30, &call_code, call_code.len());
-    // let call_ldr_allocate_tls_entry = boyer_moore(
-    //     (call_drp_log_internal_addr + 5) as _, 0x30, call_code.as_ptr(), call_code.len());
     if call_ldr_allocate_tls_entry.eq(&-1) {
         return 0;
     }
@@ -717,10 +719,6 @@ pub unsafe fn find_ldrp_handle_tls_greator_win11(
         call_code.len()
     );
 
-    // let call_ldr_allocate_tls_entry = boyer_moore(
-    //     (call_drp_log_internal_addr + 5) as _, 
-    //     0x30, 
-    //     call_code.as_ptr(), call_code.len());
     if call_ldr_allocate_tls_entry.eq(&-1) {
         return 0;
     }
@@ -839,12 +837,6 @@ unsafe fn find_xref_in_text(
             &new_pattern,
             new_len,
         );
-        // let new_offset = boyer_moore(
-        //     start_addr.offset(offset), 
-        //     new_len, 
-        //     new_pattern.as_ptr() as _,
-        //     new_pattern.len()
-        // );
         if new_offset.eq(&-1) {
             let offset = offset as usize + op_code_len;
             start_addr = start_addr.add(offset);
@@ -901,30 +893,6 @@ unsafe fn calc_call_rva(start_addr: usize) -> i32 {
     let addr = (start_addr + 1) as *const i32;
     let call_addr = core::ptr::read_unaligned(addr);
     return call_addr + 5;
- }
-
-unsafe fn search(
-    begin: *const c_void, 
-    end: *const c_void, 
-    pattern: &[u8]
-) -> *const c_void {
-    let start = begin as *const u8;
-    let finish = end as *const u8;
-    let pattern_len = pattern.len();
-    let mut current = start;
-    while current <= finish.sub(1) {
-        if current.add(pattern_len - 1) > finish {
-            break; 
-        }
-        if core::ptr::eq(
-            core::slice::from_raw_parts(current, pattern_len).as_ptr(),
-            pattern.as_ptr(),
-        ) {
-            return current as *const _;
-        }
-            current = current.add(1);
-    }
-        core::ptr::null()
 }
 
 #[no_mangle]
@@ -950,7 +918,24 @@ extern "C" fn memcmp(
     }
 }
 
-unsafe fn get_ldrp_handle_tls_offset_data(win_ver: &WinVer) -> (&[u8], usize) {
+
+#[no_mangle]
+pub extern "system" fn __CxxFrameHandler3(
+    _: *mut u8, 
+    _: *mut u8, 
+    _: *mut u8, 
+    _: *mut u8
+) -> i32 { unimplemented!() }
+
+#[repr(C)]
+struct ldrp_handle_tls_search {
+    pattern: [u8; 0x10],
+    real_len: usize,
+    offset: usize,
+}
+
+unsafe fn get_ldrp_handle_tls_offset_data(win_ver: &WinVer) -> ldrp_handle_tls_search {
+    let mut ret_pattern: ldrp_handle_tls_search = core::mem::zeroed();
     #[cfg(target_arch = "x86_64")]
     {
         if IsWindows10RS3OrGreater(win_ver) {
@@ -960,46 +945,122 @@ unsafe fn get_ldrp_handle_tls_offset_data(win_ver: &WinVer) -> (&[u8], usize) {
             } else if IsWindows10RS4OrGreater(win_ver) {
                 offset = 0x44;
             }
-        //     return (b"\x74\x33\x44\x8d\x43\x09", offset);
-        // } else if IsWindows10RS2OrGreater(win_ver) {
-        //     return (b"\x74\x33\x44\x8d\x43\x09", 0x43);
-        // } else if IsWindows8Point1OrGreater(win_ver) {
-        //     return (b"\x44\x8d\x43\x09\x4c\x8d\x4c\x24\x38", 0x43);
-        // } else if IsWindows8OrGreater(win_ver) {
-        //     return (b"\x48\x8b\x79\x30\x45\x8d\x66\x01", 0x49);
-        // } else if IsWindows7OrGreater(win_ver) {
-        //     let update1 = win_ver.rversion.gt(&24059);
-        //     let code = b"\x41\xb8\x09\x00\x00\x00\x48\x8d\x44\x24\x38";
-        //     return (code, if update1 { 0x23 } else { 0x27 });
+            let pattern = [
+                0x74, 0x33, 0x44, 0x8D, 0x43, 0x09
+            ];
+            srdi_memcpy(
+                ret_pattern.pattern.as_mut_ptr(), 
+                pattern.as_ptr(), 
+                pattern.len()
+            );
+            ret_pattern.offset = offset;
+            ret_pattern.real_len = pattern.len();
+            // return (b"\x74\x33\x44\x8d\x43\x09", offset);
+        } else if IsWindows10RS2OrGreater(win_ver) {
+            let pattern = [
+                0x74, 0x33, 0x44, 0x8D, 0x43, 0x09
+            ];
+            srdi_memcpy(ret_pattern.pattern.as_mut_ptr(), pattern.as_ptr(), pattern.len());
+            ret_pattern.real_len = pattern.len();
+            ret_pattern.offset = 0x43;
+        } else if IsWindows8Point1OrGreater(win_ver) {
+            let pattern = [
+                0x44, 0x8D, 0x43, 0x09, 0x4C, 0x8D, 0x4C, 0x24, 0x38
+            ];
+            srdi_memcpy(ret_pattern.pattern.as_mut_ptr(), pattern.as_ptr(), pattern.len());
+            ret_pattern.real_len = pattern.len();
+            ret_pattern.offset = 0x43;
+            // return (b"\x44\x8d\x43\x09\x4c\x8d\x4c\x24\x38", 0x43);
+        } else if IsWindows8OrGreater(win_ver) {
+            let pattern = [
+                0x48, 0x8B, 0x79, 0x30, 0x45, 0x8D, 0x66, 0x01
+            ];
+            srdi_memcpy(ret_pattern.pattern.as_mut_ptr(), pattern.as_ptr(), pattern.len());
+            ret_pattern.real_len = pattern.len();
+            ret_pattern.offset = 0x49;
+            // return (b"\x48\x8b\x79\x30\x45\x8d\x66\x01", 0x49);
+        } else if IsWindows7OrGreater(win_ver) {
+            let update1 = win_ver.rversion.gt(&24059);
+            let pattern = [
+                0x41, 0xB8, 0x09, 0x00, 0x00, 0x00, 0x48, 0x8D, 0x44, 0x24, 0x38
+            ];
+            srdi_memcpy(ret_pattern.pattern.as_mut_ptr(), pattern.as_ptr(), pattern.len());
+            ret_pattern.real_len = pattern.len();
+            ret_pattern.offset = if update1 { 0x23 } else { 0x27 };
+            // let code = b"\x41\xb8\x09\x00\x00\x00\x48\x8d\x44\x24\x38";
+            // return (code, if update1 { 0x23 } else { 0x27 });
         }
     }
     #[cfg(target_arch = "x86")]
     {
         if IsWindows10RS3OrGreater(win_ver) {
-            let mut pattern = b"\x8b\xc1\x8d\x4d\xbc\x51";
+            let pattern = [
+                0x8b, 0xc1, 0x8d, 0x4d, 0x08, 0x51
+            ];
+            srdi_memcpy(ret_pattern.pattern.as_mut_ptr(), pattern.as_ptr(), pattern.len());
+            ret_pattern.real_len = pattern.len();
+            // let mut pattern = b"\x8b\xc1\x8d\x4d\xbc\x51";
             if IsWindows10RS5OrGreater(win_ver) {
-                pattern = b"\x33\xf6\x85\xc0\x79\x03";
+                let pattern = [
+                    0x33, 0xf6, 0x85, 0xc0, 0x79, 0x03
+                ];
+                srdi_memcpy(ret_pattern.pattern.as_mut_ptr(), pattern.as_ptr(), pattern.len());
+                ret_pattern.real_len = pattern.len();
+                // pattern = b"\x33\xf6\x85\xc0\x79\x03";
             } else if IsWindows10RS4OrGreater(win_ver) {
-                pattern = b"\x8b\xc1\x8d\x4d\xac\x51";
+                let pattern = [
+                    0x8b, 0xc1, 0x8d, 0x4d, 0xac, 0x51
+                ];
+                srdi_memcpy(ret_pattern.pattern.as_mut_ptr(), pattern.as_ptr(), pattern.len());
+                ret_pattern.real_len = pattern.len();
+                // pattern = b"\x8b\xc1\x8d\x4d\xac\x51";
             }
-            let mut offset = 0x18;
+            // let mut offset = 0x18;
+            ret_pattern.offset = 0x18;
             if IsWindows1020H1OrGreater(win_ver) {
-                offset = 0x2C;
+                ret_pattern.offset = 0x2c;
+                // offset = 0x2C;
             } else if IsWindows1019H1OrGreater(win_ver) {
-                offset = 0x2E;
+                ret_pattern.offset = 0x2e;
+                // offset = 0x2E;
             } else if IsWindows10RS5OrGreater(win_ver) {
-                offset = 0x2C;
+                ret_pattern.offset = 0x2c;
+                // offset = 0x2C;
             }
-            return (pattern, offset);
+            // return (pattern, offset);
         } else if IsWindows10RS2OrGreater(win_ver) {
-            return (b"\x8b\xc1\x8d\x4d\xbc\x51", 0x18);
+            let pattern = [
+                0x8b, 0xc1, 0x8d, 0x4d, 0xbc, 0x51
+            ];
+            srdi_memcpy(ret_pattern.pattern.as_mut_ptr(), pattern.as_ptr(), pattern.len());
+            ret_pattern.real_len = pattern.len();
+            ret_pattern.offset = 0x18;
+            // return (b"\x8b\xc1\x8d\x4d\xbc\x51", 0x18);
         } else if IsWindows8Point1OrGreater() {
-            return (b"\x50\x6a\x09\x6a\x01\x8b\xc1", 0x1B);
+            let pattern = [
+                0x50, 0x6a, 0x09, 0x6a, 0x01, 0x8b, 0xc1
+            ];
+            srdi_memcpy(ret_pattern.pattern.as_mut_ptr(), pattern.as_ptr(), pattern.len());
+            ret_pattern.real_len = pattern.len();
+            ret_pattern.offset = 0x1B;
+            // return (b"\x50\x6a\x09\x6a\x01\x8b\xc1", 0x1B);
         } else if IsWindows8OrGreater() {
-            return (b"\x8b\x45\x08\x89\x45\xa0", 0xC);
+            let pattern = [
+                0x8b, 0x45, 0x08, 0x89, 0x45, 0xa0
+            ];
+            srdi_memcpy(ret_pattern.pattern.as_mut_ptr(), pattern.as_ptr(), pattern.len());
+            ret_pattern.real_len = pattern.len();
+            ret_pattern.offset = 0xC;
+            // return (b"\x8b\x45\x08\x89\x45\xa0", 0xC);
         } else if IsWindows7OrGreater() {
-            return (b"\x74\x20\x8d\x45\xd4\x50\x6a\x09", 0x14);
+            let pattern = [
+                0x74, 0x20, 0x8d, 0x45, 0xd4, 0x50, 0x6a, 0x09
+            ];
+            srdi_memcpy(ret_pattern.pattern.as_mut_ptr(), pattern.as_ptr(), pattern.len());
+            ret_pattern.real_len = pattern.len();
+            ret_pattern.offset = 0x14;
+            // return (b"\x74\x20\x8d\x45\xd4\x50\x6a\x09", 0x14);
         }
     }
-    return (&[0;0], 0)
+    return ret_pattern;
 }
