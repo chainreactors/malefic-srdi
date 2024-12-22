@@ -296,78 +296,7 @@ pub unsafe fn loader(dll: *const c_void) {
 
     let _ = nt_flush_instruction_cache(-1 as _, null(), 0);
     let win_ver = get_win_ver(rtl_get_version);
-    let mut ldrp_handle_tls: usize = 0;
-    if IsWindows11BetaOrGreater(&win_ver) {
-        loop {
-            let str_pattern: [u8; 18] = [
-                0x4C, 0x64, 0x72, 0x70, 0x49, 0x6E, 
-                0x69, 0x74, 0x69, 0x61, 0x6C, 0x69, 
-                0x7A, 0x65, 0x54, 0x6C, 0x73, 0x00
-            ];
-            let rdata_pattern: [u8; 6] = [0x2E, 0x72, 0x64, 0x61, 0x74, 0x61];
-            let (rdata, rdata_size) = get_section_range(ntdll, &rdata_pattern);
-            if rdata.is_null() || rdata_size.eq(&0) {
-                break;
-            }
-            let rdata = rdata as *const u8;
-            let addr = boyer_moore(rdata, rdata_size, &str_pattern, str_pattern.len());
-            if addr.eq(&-1) {
-                break;
-            }
-            let addr = rdata.offset(addr) as _;
-            let s_addr  = pointer_sub(addr, ntdll as _);
-            // let s_addr = find_string_in_rdata(ntdll, &str_pattern);
-            if s_addr.is_null() {
-                break;
-            }
-
-            let start_pattern: [u8;3] = [0x4C, 0x8D, 0x05];
-            let xref_addr = 
-                find_xref_in_text(ntdll, &start_pattern, 7, s_addr as usize);
-            if xref_addr.eq(&0) {
-                break;
-            }
-            let xref_addr = xref_addr as usize + ntdll as usize;
-            let call_code: [u8;1] = [0xE8];
-            let call_drp_log_internal_addr = boyer_moore(
-                    xref_addr as _, 0x30, &call_code, call_code.len());
-            if call_drp_log_internal_addr.eq(&-1) {
-                break;
-            }
-            let call_drp_log_internal_addr = 
-                call_drp_log_internal_addr as usize + xref_addr as usize;
-            let call_ldr_allocate_tls_entry = boyer_moore(
-                (call_drp_log_internal_addr + 5) as _, 0x30, &call_code, call_code.len());
-            if call_ldr_allocate_tls_entry.eq(&-1) {
-                break;
-            }
-            let call_ldr_allocate_tls_entry = 
-                call_ldr_allocate_tls_entry as usize + 
-                call_drp_log_internal_addr + 5;
-
-            let ldr_allocate_tls_entry = call_ldr_allocate_tls_entry + 
-            calc_call_rva(call_ldr_allocate_tls_entry as _) as usize;
-            let black_list: [usize; 1] = [call_ldr_allocate_tls_entry];
-            let call_ldr_allocate_tls_entry2 = 
-                find_call_rva_in_text(ntdll, ldr_allocate_tls_entry, &black_list);
-            if call_ldr_allocate_tls_entry2.eq(&0) {
-                break;
-            }
-
-            ldrp_handle_tls =  find_func_start(ntdll, call_ldr_allocate_tls_entry2) as _;
-            break;
-        }
-    }
-    if ldrp_handle_tls.ne(&0) {
-        let mut ldr_data_table_entry: LDR_DATA_TABLE_ENTRY = core::mem::zeroed();
-        ldr_data_table_entry.DllBase = virtual_base_address;
-        transmute::<*const c_void, LdrpHandleTlsData>(ldrp_handle_tls as _)(
-            &mut ldr_data_table_entry as *mut _ as _
-        );
-        // transmute::<*const c_void, LdrpHandleTlsData>(0x7ffe68034528usize as _)(
-        //     &mut ldr_data_table_entry as *mut _ as _
-        // );
-    }
+    LdrpHandleTlsData(ntdll, virtual_base_address, &win_ver);
 
     let tls_data = &option_header.DataDirectory[9];
     if tls_data.Size.gt(&0) {
@@ -685,58 +614,69 @@ unsafe fn search_ldrp_handle_tls(
 
 #[no_mangle]
 pub unsafe fn find_ldrp_handle_tls_greator_win11(
-    module_base: *const c_void
+    ntdll: *const c_void
 ) -> usize {
-    let str_pattern: [u8; 18] = [
-        0x4C, 0x64, 0x72, 0x70, 0x49, 0x6E, 
-        0x69, 0x74, 0x69, 0x61, 0x6C, 0x69, 
-        0x7A, 0x65, 0x54, 0x6C, 0x73, 0x00
-    ];
-    let s_addr = 
-        find_string_in_rdata(module_base, &str_pattern);
-    if s_addr.is_null() {
-        return 0;
-    }
-    let start_pattern: [u8;3] = [0x4C, 0x8D, 0x05];
-    let xref_addr = 
-        find_xref_in_text(module_base, &start_pattern, 7, s_addr as usize);
-    let call_code: [u8;1] = [0xE8];
-    let call_drp_log_internal_addr = boyer_moore(
-        xref_addr as _, 0x30, &call_code, call_code.len());
-    if call_drp_log_internal_addr.eq(&-1) {
-        return 0;
-    }
-    let call_drp_log_internal_addr = call_drp_log_internal_addr as usize + xref_addr as usize;
-    let call_ldr_allocate_tls_entry = boyer_moore(
-        (call_drp_log_internal_addr + 5) as _, 0x30, &call_code, call_code.len());
-    if call_ldr_allocate_tls_entry.eq(&-1) {
-        return 0;
-    }
-    let call_ldr_allocate_tls_entry = boyer_moore(
-        (call_drp_log_internal_addr + 5) as _, 
-        0x30, 
-        &call_code,
-        call_code.len()
-    );
-
-    if call_ldr_allocate_tls_entry.eq(&-1) {
-        return 0;
-    }
-    let call_ldr_allocate_tls_entry = 
-        call_ldr_allocate_tls_entry as usize + call_drp_log_internal_addr + 5;
-    let ldr_allocate_tls_entry = call_ldr_allocate_tls_entry + 
-    calc_call_rva(call_ldr_allocate_tls_entry as _) as usize;
-    let black_list: [usize; 1] = [call_ldr_allocate_tls_entry];
-    let call_ldr_allocate_tls_entry2 = 
-        find_call_rva_in_text(module_base, ldr_allocate_tls_entry, &black_list);
-    if call_ldr_allocate_tls_entry2.eq(&0) {
-        return 0;
-    }
-
-    find_func_start(module_base, call_ldr_allocate_tls_entry2)
+    loop {
+        let str_pattern: [u8; 18] = [
+            0x4C, 0x64, 0x72, 0x70, 0x49, 0x6E, 
+            0x69, 0x74, 0x69, 0x61, 0x6C, 0x69, 
+            0x7A, 0x65, 0x54, 0x6C, 0x73, 0x00
+        ];
+        let rdata_pattern: [u8; 6] = [0x2E, 0x72, 0x64, 0x61, 0x74, 0x61];
+        let (rdata, rdata_size) = get_section_range(ntdll, &rdata_pattern);
+        if rdata.is_null() || rdata_size.eq(&0) {
+            break;
+        }
+        let rdata = rdata as *const u8;
+        let addr = boyer_moore(rdata, rdata_size, &str_pattern, str_pattern.len());
+        if addr.eq(&-1) {
+            break;
+        }
+        let addr = rdata.offset(addr) as _;
+        let s_addr  = pointer_sub(addr, ntdll as _);
+        if s_addr.is_null() {
+            break;
+        }
     
+        let start_pattern: [u8;3] = [0x4C, 0x8D, 0x05];
+        let xref_addr = 
+            find_xref_in_text(ntdll, &start_pattern, 7, s_addr as usize);
+        if xref_addr.eq(&0) {
+            break;
+        }
+        let xref_addr = xref_addr as usize + ntdll as usize;
+        let call_code: [u8;1] = [0xE8];
+        let call_drp_log_internal_addr = boyer_moore(
+                xref_addr as _, 0x30, &call_code, call_code.len());
+        if call_drp_log_internal_addr.eq(&-1) {
+            break;
+        }
+        let call_drp_log_internal_addr = 
+                    call_drp_log_internal_addr as usize + xref_addr as usize;
+                let call_ldr_allocate_tls_entry = boyer_moore(
+                    (call_drp_log_internal_addr + 5) as _, 0x30, &call_code, call_code.len());
+                if call_ldr_allocate_tls_entry.eq(&-1) {
+                    break;
+                }
+                let call_ldr_allocate_tls_entry = 
+                    call_ldr_allocate_tls_entry as usize + 
+                    call_drp_log_internal_addr + 5;
+    
+                let ldr_allocate_tls_entry = call_ldr_allocate_tls_entry + 
+                calc_call_rva(call_ldr_allocate_tls_entry as _) as usize;
+                let black_list: [usize; 1] = [call_ldr_allocate_tls_entry];
+                let call_ldr_allocate_tls_entry2 = 
+                    find_call_rva_in_text(ntdll, ldr_allocate_tls_entry, &black_list);
+                if call_ldr_allocate_tls_entry2.eq(&0) {
+                    break;
+                }
+    
+        return find_func_start(ntdll, call_ldr_allocate_tls_entry2);
+    }
+    0
 }
 
+#[no_mangle]
 unsafe fn find_string_in_rdata(
     module_base: *const c_void, 
     pattern: &[u8]
@@ -788,6 +728,7 @@ unsafe fn find_func_start(
     }
 }
 
+#[no_mangle]
 unsafe fn find_xref_in_text(
     module_base: *const c_void,
     start_pattern: &[u8], 
@@ -852,6 +793,7 @@ unsafe fn find_xref_in_text(
     }
 }
 
+#[no_mangle]
 unsafe fn find_call_rva_in_text(
     module_base: *const c_void,
     func_addr: usize,
@@ -917,7 +859,6 @@ extern "C" fn memcmp(
         srdi_memcmp(dest as _, src as _, size)
     }
 }
-
 
 #[no_mangle]
 pub extern "system" fn __CxxFrameHandler3(
