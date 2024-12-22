@@ -1,0 +1,1005 @@
+use core:: {
+    arch::asm, ffi::c_void, mem::{
+        size_of, transmute
+    }, ptr::{null, read_unaligned}, 
+};
+
+
+use crate::{types::{
+    BuildThreshold, DllMain, GetProcAddress, LdrpHandleTlsData, LoadLibraryA, NtFlushInstructionCache, RtlAddFunctionTable, RtlGetVersion, VerShort, VirtualAlloc, VirtualProtect, WinVer, BASE_RELOCATION_BLOCK, BASE_RELOCATION_ENTRY, IMAGE_ORDINAL, IMAGE_RUNTIME_FUNCTION_ENTRY, OSVERSIONINFOEXW, WIN32_WIN_NT_WIN10, WIN32_WIN_NT_WIN7, WIN32_WIN_NT_WIN8, WIN32_WIN_NT_WINBLUE, WIN32_WIN_NT_WINXP
+}, utils::srdi_memcmp};
+
+use crate::utils::{boyer_moore, dbj2_str_hash, get_cstr_len, pointer_add, pointer_sub, srdi_memcpy, srdi_memset, IsWindows1019H1OrGreater, IsWindows10RS2OrGreater, IsWindows10RS3OrGreater, IsWindows10RS4OrGreater, IsWindows11BetaOrGreater, IsWindows7OrGreater, IsWindows8OrGreater, IsWindows8Point1OrGreater};
+use winapi::um::winnt::{IMAGE_BASE_RELOCATION, IMAGE_DELAYLOAD_DESCRIPTOR, IMAGE_DOS_HEADER, IMAGE_DOS_SIGNATURE, IMAGE_EXPORT_DIRECTORY, IMAGE_IMPORT_BY_NAME, IMAGE_IMPORT_DESCRIPTOR, IMAGE_NT_SIGNATURE, IMAGE_ORDINAL_FLAG, IMAGE_SCN_MEM_EXECUTE, IMAGE_SCN_MEM_READ, IMAGE_SCN_MEM_WRITE, IMAGE_SECTION_HEADER, IMAGE_THUNK_DATA, IMAGE_TLS_DIRECTORY, MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY, PAGE_READONLY, PAGE_READWRITE, PAGE_WRITECOPY};
+use windows_sys::Win32::System::{Threading::{PEB, PEB_LDR_DATA}, WindowsProgramming::LDR_DATA_TABLE_ENTRY};
+
+
+#[cfg(not(test))]
+#[panic_handler]
+fn panic(_info: &core::panic::PanicInfo) -> ! {
+    loop {}
+}
+
+pub type Main = extern "system" fn();
+
+pub unsafe fn loader(dll: *const c_void) {
+    let module_base = dll;
+    let dos_headers = module_base as *mut IMAGE_DOS_HEADER;
+    if (*dos_headers).e_magic.ne(&IMAGE_DOS_SIGNATURE) {
+        return;
+    }
+
+    let nt_header = get_nt_header!(module_base);
+    if (*nt_header).Signature.ne(&IMAGE_NT_SIGNATURE) {
+        return;
+    }
+    let option_header = &(*nt_header).OptionalHeader;
+    let file_header = &(*nt_header).FileHeader;
+
+    let section_header = 
+            pointer_add(
+                option_header as _, 
+                file_header.SizeOfOptionalHeader as usize
+            ) as *const IMAGE_SECTION_HEADER;
+
+    let kernel32 = get_module_base_by_hash(0x6ddb9555);
+    let ntdll = get_module_base_by_hash(0x1edab0ed);
+    if kernel32.is_null() || ntdll.is_null() {
+        return;
+    }
+
+    let load_library_a = get_export_by_hash(kernel32, 0xb7072fdb);
+    let get_proc_address = get_export_by_hash(kernel32, 0xdecfc1bf);
+    let virtual_alloc = get_export_by_hash(kernel32, 0x97bc257);
+    let virtual_protect = get_export_by_hash(kernel32, 0xe857500d);
+    let rtl_add_function_table = get_export_by_hash(ntdll, 0x81a887ce);
+    let nt_flush_instruction_cache = get_export_by_hash(ntdll, 0x6269b87f);
+    let rtl_get_version = get_export_by_hash(ntdll, 0xdde5cdd);
+
+    if load_library_a.is_null() || get_proc_address.is_null() ||
+        virtual_alloc.is_null() || virtual_protect.is_null()  ||
+        nt_flush_instruction_cache.is_null() || rtl_get_version.is_null() ||
+        rtl_add_function_table.is_null() {
+            return;
+    }
+
+    let load_library_a: LoadLibraryA = transmute(load_library_a);
+    let get_proc_address: GetProcAddress = transmute(get_proc_address);
+    let virtual_alloc: VirtualAlloc = transmute(virtual_alloc);
+    let virtual_protect: VirtualProtect = transmute(virtual_protect);
+    let rtl_add_function_table: RtlAddFunctionTable = 
+        transmute(rtl_add_function_table);
+
+    let nt_flush_instruction_cache: NtFlushInstructionCache = 
+        transmute(nt_flush_instruction_cache);
+    let mut rebase_offset = 0;
+
+    let mut virtual_base_address = virtual_alloc(
+        option_header.ImageBase as _,
+        option_header.SizeOfImage as _,
+        MEM_RESERVE | MEM_COMMIT,
+        PAGE_READWRITE
+    );
+
+    if virtual_base_address.is_null() {
+        virtual_base_address = virtual_alloc(
+            0 as *mut c_void,
+            option_header.SizeOfImage as _,
+            MEM_RESERVE | MEM_COMMIT,
+            PAGE_READWRITE
+        );
+        if virtual_base_address.is_null() {
+            return;
+        }
+        rebase_offset = 
+            virtual_base_address as usize - option_header.ImageBase as usize;
+    }
+
+    srdi_memcpy(
+        virtual_base_address as _, 
+        module_base as _, 
+        option_header.SizeOfHeaders as _
+    );
+    let mut section_header = section_header;
+
+    for _ in 0..file_header.NumberOfSections {
+        let mut _old_protection = 0;
+        let section_addr = pointer_add(
+            virtual_base_address, 
+            (*section_header).VirtualAddress as _);
+        let section_data = pointer_add(
+            module_base, 
+            (*section_header).PointerToRawData as _);
+        srdi_memcpy(section_addr as _, section_data as _,
+            (*section_header).SizeOfRawData as _);
+
+        section_header = section_header.offset(1);
+    }
+
+    let relocations = &option_header.DataDirectory[5];
+
+    if rebase_offset.ne(&0) && relocations.Size.ne(&0) {
+        let block_size = size_of::<BASE_RELOCATION_BLOCK>();
+        let entry_size = size_of::<BASE_RELOCATION_ENTRY>();
+        let mut reloc_block = pointer_add(
+            virtual_base_address, 
+            relocations.VirtualAddress as _
+        ) as *mut IMAGE_BASE_RELOCATION;
+        
+        while (*reloc_block).VirtualAddress.ne(&0) {
+            let relocation_count = (
+                (*reloc_block).SizeOfBlock - block_size as u32
+            ) / entry_size as u32;
+            let relocation_entry = pointer_add(reloc_block, block_size) 
+                as *const BASE_RELOCATION_ENTRY;
+
+            for i in 0..relocation_count {
+                let entry = relocation_entry.offset(i as _);
+                if (*entry).type_().eq(&0) {
+                    continue;
+                }
+                let rva = (*reloc_block).VirtualAddress as usize +
+                    (*entry).offset_() as usize;
+                let dest = pointer_add(virtual_base_address, rva as _);
+                *(dest as *mut usize) = *(dest as *mut usize) + 
+                    rebase_offset as usize;
+                
+            }
+            reloc_block = pointer_add(
+                reloc_block as _, 
+                (*reloc_block).SizeOfBlock as _) as *mut IMAGE_BASE_RELOCATION;
+        }
+    }
+
+    let imports = &option_header.DataDirectory[1];
+    let mut import_descriptor_ptr = 
+            pointer_add(
+                virtual_base_address, 
+                imports.VirtualAddress as usize
+            ) as *const IMAGE_IMPORT_DESCRIPTOR;
+
+    while (*import_descriptor_ptr).Name.ne(&0) {
+        let lib_name = 
+                pointer_add(
+                    virtual_base_address, 
+                    (*import_descriptor_ptr).Name as _
+                );
+        let lib = load_library_a(lib_name as *mut i8);
+
+        let mut ori_thunk_ptr;
+        if (*import_descriptor_ptr).u.OriginalFirstThunk().ne(&0) {
+            ori_thunk_ptr = pointer_add(
+                virtual_base_address, 
+                *(*import_descriptor_ptr).u.OriginalFirstThunk() as usize
+            ) as *mut IMAGE_THUNK_DATA;
+        } else {
+            ori_thunk_ptr = pointer_add(
+                virtual_base_address, 
+                (*import_descriptor_ptr).FirstThunk as _
+            ) as *mut IMAGE_THUNK_DATA;
+        };
+            
+        let mut thunk_ptr = pointer_add(
+                    virtual_base_address, 
+                    (*import_descriptor_ptr).FirstThunk as _
+                ) as *mut IMAGE_THUNK_DATA;
+        
+        while (*ori_thunk_ptr).u1.Function().ne(&0) {
+            let ordinal = (*ori_thunk_ptr).u1.Ordinal();
+            if IMAGE_SNAP_BY_ORDINAL(ordinal) {
+                let ordinal = IMAGE_ORDINAL_FUNC(ordinal);
+                *(*thunk_ptr).u1.Function_mut() = 
+                    get_proc_address(lib, (ordinal) as *mut _) as _;
+            } else {
+                let name_ptr = 
+                        pointer_add(
+                            virtual_base_address, 
+                            *(*ori_thunk_ptr).u1.AddressOfData() as _
+                        ) as *mut IMAGE_IMPORT_BY_NAME;
+                *(*thunk_ptr).u1.Function_mut() = 
+                    get_proc_address(
+                        lib, &(*name_ptr).Name[0] as *const _ as *mut _) as _;
+            }
+            thunk_ptr = thunk_ptr.offset(1);
+            ori_thunk_ptr = ori_thunk_ptr.offset(1);
+        }
+
+        import_descriptor_ptr = import_descriptor_ptr.offset(1);
+    }
+
+
+    let delay_import_dir = &option_header.DataDirectory[13];
+    let mut delay_import_ptr = pointer_add(
+        virtual_base_address, 
+        delay_import_dir.VirtualAddress as _
+    ) as *mut IMAGE_DELAYLOAD_DESCRIPTOR;
+    
+    if delay_import_dir.Size.gt(&0) {
+        while (*delay_import_ptr).DllNameRVA.ne(&0) {
+            let lib_name = 
+                    pointer_add(
+                        virtual_base_address, 
+                        (*delay_import_ptr).DllNameRVA as _
+                    );
+            let lib = load_library_a(lib_name as _);
+
+            let mut orig_thunk = 
+                    pointer_add(
+                        virtual_base_address, 
+                        (*delay_import_ptr).ImportNameTableRVA as _
+                    ) as *mut IMAGE_THUNK_DATA;
+            let mut thunk = 
+                    pointer_add(
+                        virtual_base_address, 
+                        (*delay_import_ptr).ImportAddressTableRVA as _
+                    ) as *mut IMAGE_THUNK_DATA;
+            
+            while (*orig_thunk).u1.Function().ne(&0) {
+                if IMAGE_SNAP_BY_ORDINAL((*orig_thunk).u1.Ordinal() as _) {
+                    let func_ordinal = 
+                        IMAGE_ORDINAL_FUNC((*orig_thunk).u1.Ordinal() as _);
+                    *(*thunk).u1.Function_mut() = 
+                        get_proc_address(lib, func_ordinal as _) as _;
+                } else {
+                    let func_name = pointer_add(
+                        virtual_base_address, 
+                        *(*orig_thunk).u1.AddressOfData() as _
+                    ) as *mut IMAGE_IMPORT_BY_NAME;
+                    *(*thunk).u1.Function_mut() = get_proc_address(
+                        lib, &(*func_name).Name[0] as *const _ as *mut _ ) as _;
+                }
+
+                thunk = thunk.offset(1);
+                orig_thunk = orig_thunk.offset(1);
+            }
+
+            delay_import_ptr = delay_import_ptr.offset(1);
+        }
+    }
+
+    let mut section_header = pointer_add(
+        &(*nt_header).OptionalHeader as _, 
+        file_header.SizeOfOptionalHeader as _
+    ) as *const IMAGE_SECTION_HEADER;
+
+    for _ in 0..file_header.NumberOfSections {
+        let mut _old_protection = 0;
+        let section_addr = pointer_add(
+            virtual_base_address, 
+            (*section_header).VirtualAddress as _
+        );
+
+        let protection = match (
+            ((*section_header).Characteristics & IMAGE_SCN_MEM_EXECUTE).ne(&0),
+            ((*section_header).Characteristics & IMAGE_SCN_MEM_WRITE).ne(&0),
+            ((*section_header).Characteristics & IMAGE_SCN_MEM_READ).ne(&0),
+        ) {
+            (true, true, true) => PAGE_EXECUTE_READWRITE,
+            (true, true, false) => PAGE_EXECUTE_WRITECOPY,
+            (true, false, true) => PAGE_EXECUTE_READ,
+            (true, false, false) => PAGE_EXECUTE,
+            (false, true, true) => PAGE_READWRITE,
+            (false, true, false) => PAGE_WRITECOPY,
+            (false, false, true) => PAGE_READONLY,
+            _ => 0,
+        };
+
+        virtual_protect(
+            section_addr,
+            (*section_header).SizeOfRawData as _,
+            protection,
+            &mut _old_protection
+        );
+        section_header = section_header.offset(1);
+    }
+
+
+    let _ = nt_flush_instruction_cache(-1 as _, null(), 0);
+    let win_ver = get_win_ver(rtl_get_version);
+    let mut ldrp_handle_tls: usize = 0;
+    if IsWindows11BetaOrGreater(&win_ver) {
+        loop {
+            let str_pattern: [u8; 18] = [
+                0x4C, 0x64, 0x72, 0x70, 0x49, 0x6E, 
+                0x69, 0x74, 0x69, 0x61, 0x6C, 0x69, 
+                0x7A, 0x65, 0x54, 0x6C, 0x73, 0x00
+            ];
+            let rdata_pattern: [u8; 6] = [0x2E, 0x72, 0x64, 0x61, 0x74, 0x61];
+            let (rdata, rdata_size) = get_section_range(ntdll, &rdata_pattern);
+            if rdata.is_null() || rdata_size.eq(&0) {
+                break;
+            }
+            let rdata = rdata as *const u8;
+            let addr = boyer_moore(rdata, rdata_size, &str_pattern, str_pattern.len());
+            if addr.eq(&-1) {
+                break;
+            }
+            let addr = rdata.offset(addr) as _;
+            let s_addr  = pointer_sub(addr, ntdll as _);
+            // let s_addr = find_string_in_rdata(ntdll, &str_pattern);
+            if s_addr.is_null() {
+                break;
+            }
+
+            let start_pattern: [u8;3] = [0x4C, 0x8D, 0x05];
+            let xref_addr = 
+                find_xref_in_text(ntdll, &start_pattern, 7, s_addr as usize);
+            if xref_addr.eq(&0) {
+                break;
+            }
+            let xref_addr = xref_addr as usize + ntdll as usize;
+            let call_code: [u8;1] = [0xE8];
+            let call_drp_log_internal_addr = boyer_moore(
+                    xref_addr as _, 0x30, &call_code, call_code.len());
+            if call_drp_log_internal_addr.eq(&-1) {
+                break;
+            }
+            let call_drp_log_internal_addr = 
+                call_drp_log_internal_addr as usize + xref_addr as usize;
+            let call_ldr_allocate_tls_entry = boyer_moore(
+                (call_drp_log_internal_addr + 5) as _, 0x30, &call_code, call_code.len());
+            if call_ldr_allocate_tls_entry.eq(&-1) {
+                break;
+            }
+            let call_ldr_allocate_tls_entry = 
+                call_ldr_allocate_tls_entry as usize + 
+                call_drp_log_internal_addr + 5;
+
+            let ldr_allocate_tls_entry = call_ldr_allocate_tls_entry + 
+            calc_call_rva(call_ldr_allocate_tls_entry as _) as usize;
+            let black_list: [usize; 1] = [call_ldr_allocate_tls_entry];
+            let call_ldr_allocate_tls_entry2 = 
+                find_call_rva_in_text(ntdll, ldr_allocate_tls_entry, &black_list);
+            if call_ldr_allocate_tls_entry2.eq(&0) {
+                break;
+            }
+
+            ldrp_handle_tls =  find_func_start(ntdll, call_ldr_allocate_tls_entry2) as _;
+            break;
+        }
+    }
+    if ldrp_handle_tls.ne(&0) {
+        let mut ldr_data_table_entry: LDR_DATA_TABLE_ENTRY = core::mem::zeroed();
+        ldr_data_table_entry.DllBase = virtual_base_address;
+        transmute::<*const c_void, LdrpHandleTlsData>(ldrp_handle_tls as _)(
+            &mut ldr_data_table_entry as *mut _ as _
+        );
+        // transmute::<*const c_void, LdrpHandleTlsData>(0x7ffe68034528usize as _)(
+        //     &mut ldr_data_table_entry as *mut _ as _
+        // );
+    }
+
+    let tls_data = &option_header.DataDirectory[9];
+    if tls_data.Size.gt(&0) {
+        let tls_dir_ptr = pointer_add(
+            virtual_base_address, 
+            tls_data.VirtualAddress as _
+        ) as *mut IMAGE_TLS_DIRECTORY;
+        let mut callback_ptr = 
+            (*tls_dir_ptr).AddressOfCallBacks as *const *const c_void;
+
+        while !(*callback_ptr).is_null() {
+            transmute::<*const c_void, DllMain>(*callback_ptr)(
+                virtual_base_address as _, 1, 0 as _);
+            callback_ptr = callback_ptr.offset(1);
+        }
+    }
+
+    let exception_dir = &option_header.DataDirectory[3];
+    if exception_dir.Size.gt(&0) {
+        let rf_entry = pointer_add(
+            virtual_base_address, 
+            tls_data.VirtualAddress as usize
+        ) as *mut IMAGE_RUNTIME_FUNCTION_ENTRY;
+        let _  = rtl_add_function_table(
+            rf_entry,
+            (exception_dir.Size / 
+                size_of::<IMAGE_RUNTIME_FUNCTION_ENTRY>() as u32) - 1, 
+            virtual_base_address as _);
+    }
+
+    let entrypoint = pointer_add(
+        virtual_base_address, 
+        option_header.AddressOfEntryPoint as _
+    );
+    transmute::<usize, DllMain>(entrypoint as _)(0 as _, 1, 0 as _);
+}
+
+#[used]
+#[no_mangle]
+pub static _fltused: i32 = 0;
+
+#[inline]
+fn IMAGE_SNAP_BY_ORDINAL(ordinal: &u64) -> bool {
+    (ordinal & IMAGE_ORDINAL_FLAG) != 0
+}
+
+#[inline]
+fn IMAGE_ORDINAL_FUNC(odrinal: &u64) -> usize {
+    (odrinal & (IMAGE_ORDINAL as u64)) as _
+}
+
+#[inline]
+fn get_peb() -> usize {
+    let ax: usize;
+    #[cfg(target_arch = "x86_64")] {
+        unsafe {
+            asm!(
+                "mov {}, qword ptr gs:[0x60]",
+                lateout(reg) ax,
+                options(nostack, pure, readonly),
+            );
+        }
+    }
+    #[cfg(target_arch = "x86")] {
+        let eax: u32;
+        unsafe {
+            asm!(
+                "mov {}, dword ptr fs:[0x30]",
+                out(reg) eax,
+                options(nostack, pure, readonly),
+            );
+        }
+        ax = eax as _;
+        return ax;
+    }
+    ax
+}
+
+#[no_mangle]
+unsafe fn memset(dst: *mut c_void, val: u8, len: usize) {
+    srdi_memset(dst as _, val, len);
+}
+
+unsafe fn get_win_ver(rtl_get_version: *const core::ffi::c_void) -> WinVer {
+    let mut native: OSVERSIONINFOEXW = core::mem::zeroed();
+        transmute::<*const c_void, RtlGetVersion>(rtl_get_version)(
+            &mut native as *mut _ as _);
+        let fullver = native.dwMajorVersion << 8 | native.dwMinorVersion;
+        let ver = match fullver {
+            WIN32_WIN_NT_WIN10 => {
+                if native.dwBuildNumber.ge(
+                    &(BuildThreshold::BUILD_Win11Beta as _)) {
+                    VerShort::WIN11_Beta
+                } else if native.dwBuildNumber.ge(
+                    &(BuildThreshold::BUILD_20_H1 as _)) {
+                    VerShort::WIN10_20H1
+                } else if native.dwBuildNumber.ge(
+                    &(BuildThreshold::BUILD_19_H2 as _)) {
+                    VerShort::WIN10_19H2
+                } else if native.dwBuildNumber.ge(
+                    &(BuildThreshold::BUILD_19_H1 as _)) {
+                    VerShort::WIN10_19H1
+                } else if native.dwBuildNumber.ge(
+                    &(BuildThreshold::BUILD_RS5 as _)) {
+                    VerShort::WIN10_RS6
+                } else if native.dwBuildNumber.ge(
+                    &(BuildThreshold::BUILD_RS4 as _)) {
+                    VerShort::WIN10_RS5
+                } else if native.dwBuildNumber.ge(
+                    &(BuildThreshold::BUILD_RS3 as _)) {
+                    VerShort::WIN10_RS4
+                } else if native.dwBuildNumber.ge(
+                    &(BuildThreshold::BUILD_RS2 as _)) {
+                    VerShort::WIN10_RS3
+                } else if native.dwBuildNumber.ge(
+                    &(BuildThreshold::BUILD_RS1 as _)) {
+                    VerShort::WIN10_RS2
+                } else if native.dwBuildNumber.ge(
+                    &(BuildThreshold::BUILD_RS0 as _)) {
+                    VerShort::WIN10_RS1
+                } else {
+                    VerShort::WIN10
+                }
+            },
+            WIN32_WIN_NT_WINBLUE => {
+                VerShort::WIN8_POINT1
+            },
+            WIN32_WIN_NT_WIN8 => {
+                VerShort::WIN8
+            },
+            WIN32_WIN_NT_WIN7 => {
+                VerShort::WIN7
+            },
+            WIN32_WIN_NT_WINXP => {
+                VerShort::WIN_XP
+            },
+            _ => VerShort::WIN_UNSUPPORTED
+        };
+        WinVer {
+            ver,
+            rversion: native.dwBuildNumber,
+            native
+        }
+}
+
+unsafe fn get_module_base_by_hash(module_hash: u32) -> *const c_void {
+    let peb = get_peb() as *mut PEB;
+    let peb_ldr_data_ptr = (*peb).Ldr as *mut PEB_LDR_DATA;
+    let mut module_list = (*peb_ldr_data_ptr).InMemoryOrderModuleList.Flink 
+        as *mut LDR_DATA_TABLE_ENTRY;
+    let last_entry = (*peb_ldr_data_ptr).InMemoryOrderModuleList.Blink 
+        as *mut LDR_DATA_TABLE_ENTRY;
+    let mut module = read_unaligned(module_list);
+
+    while !module.DllBase.is_null() 
+    {
+        let dll_buffer_ptr = module.FullDllName.Buffer;
+        let dll_length = module.FullDllName.Length as usize;
+        let dll_name_slice = core::slice::from_raw_parts(
+            dll_buffer_ptr as *const u8, dll_length);
+
+        if module_hash == dbj2_str_hash(dll_name_slice) 
+        {
+            return module.Reserved2[0] as _;
+        }
+        if module_list == last_entry {
+            break;
+        }
+        module_list = module.Reserved1[0] as *mut LDR_DATA_TABLE_ENTRY;
+
+        module = read_unaligned(module_list);
+    }
+
+    null()
+}
+
+
+unsafe fn get_export_by_hash(
+    module_base: *const c_void, 
+    func_hash: u32
+) -> *const c_void {
+    let nt_headers = get_nt_header!(module_base);
+    let export_dir = &(*nt_headers).OptionalHeader.DataDirectory[0];
+    let export_dir_ptr = pointer_add(
+        module_base, 
+        export_dir.VirtualAddress as usize
+    ) as *const IMAGE_EXPORT_DIRECTORY;
+    if export_dir_ptr.is_null() {
+        return null();
+    }
+    let export_dir = read_unaligned(export_dir_ptr);
+    let func_rva = pointer_add(
+        module_base, 
+        export_dir.AddressOfFunctions as usize
+    ) as *const u32;
+    let func_name_rva = pointer_add(
+        module_base, 
+        export_dir.AddressOfNames as usize
+    ) as *const u32;
+    let func_ord_rva = pointer_add(
+        module_base, 
+        export_dir.AddressOfNameOrdinals as usize
+    ) as *const u16;
+
+    for i in 0..(export_dir.NumberOfFunctions as isize) {
+        let func_name = pointer_add(
+            module_base, 
+            read_unaligned(func_name_rva.offset(i)) as usize
+        ) as *const u8;
+        let hsah = dbj2_str_hash(core::slice::from_raw_parts(
+            func_name, get_cstr_len(func_name)));
+        if hsah.eq(&func_hash) {
+            let func_ord = read_unaligned(func_ord_rva.offset(i)) as isize;
+            return pointer_add(
+                module_base, 
+                read_unaligned(func_rva.offset(func_ord)) as usize
+            ) as _;
+        }
+    }
+
+    null()
+}
+
+
+#[no_mangle]
+unsafe fn get_section_range(
+    module_base: *const c_void, 
+    section_name: &[u8]
+) -> (*const c_void, usize) {
+    let dos_headers = module_base as *mut IMAGE_DOS_HEADER;
+    if (*dos_headers).e_magic.ne(&IMAGE_DOS_SIGNATURE) {
+        return (null(), 0);
+    }
+
+    let nt_headers = get_nt_header!(module_base);
+    if (*nt_headers).Signature.ne(&IMAGE_NT_SIGNATURE) {
+        return (null(), 0);
+    }
+
+    let file_header = &(*nt_headers).FileHeader;
+    let option_header = &(*nt_headers).OptionalHeader;
+    let mut section_header = 
+            pointer_add(
+                option_header as _, 
+                file_header.SizeOfOptionalHeader as usize
+            ) as *const IMAGE_SECTION_HEADER;
+
+    let section_name = core::str::from_utf8_unchecked(section_name);
+    for _ in 0..file_header.NumberOfSections {
+        let section = section_header;
+        let name = core::str::from_utf8_unchecked(&(*section).Name);
+        if name.contains(section_name) {
+            let section_addr = pointer_add(
+                module_base, 
+                (*section).VirtualAddress as usize
+            );
+            return (section_addr, *(*section).Misc.VirtualSize() as usize);
+        }
+        section_header = section_header.offset(1);
+    }
+
+    (null(), 0)
+}
+
+
+#[no_mangle]
+unsafe fn LdrpHandleTlsData(
+    ntdll: *const c_void,
+    hmodule: *mut c_void,
+    win_ver: &WinVer,
+) -> i32 {
+    let ldrp_handle_tls = search_ldrp_handle_tls(ntdll, win_ver);
+    if ldrp_handle_tls.is_null() {
+        return 0;
+    }
+    let mut ldr_data_table_entry: LDR_DATA_TABLE_ENTRY = 
+        core::mem::MaybeUninit::uninit().assume_init();
+    srdi_memset(
+        &mut ldr_data_table_entry as *mut _ as _,
+        0,
+        core::mem::size_of::<LDR_DATA_TABLE_ENTRY>()
+    );
+    ldr_data_table_entry.DllBase = hmodule;
+    transmute::<*const c_void, LdrpHandleTlsData>(ldrp_handle_tls)(
+        &mut ldr_data_table_entry as *mut _ as _
+    )
+}
+
+#[no_mangle]
+unsafe fn search_ldrp_handle_tls(
+    module_base: *const c_void, 
+    win_ver: &WinVer
+) -> *const c_void {
+    if module_base.is_null() {
+        return null();
+    }
+    if IsWindows11BetaOrGreater(win_ver) {
+        return find_ldrp_handle_tls_greator_win11(module_base) as _;
+    }
+    let (pattern, offset) = get_ldrp_handle_tls_offset_data(win_ver);
+    if pattern.is_empty() || offset.eq(&0) {
+        return  null();
+    }
+    let (section, size) = get_text_range(module_base);
+    if section.is_null() || size.eq(&0) {
+        return null();
+    }
+    let end = pointer_add(section, size);
+    search(section, end, pattern)
+}
+
+#[no_mangle]
+pub unsafe fn find_ldrp_handle_tls_greator_win11(
+    module_base: *const c_void
+) -> usize {
+    let str_pattern: [u8; 18] = [
+        0x4C, 0x64, 0x72, 0x70, 0x49, 0x6E, 
+        0x69, 0x74, 0x69, 0x61, 0x6C, 0x69, 
+        0x7A, 0x65, 0x54, 0x6C, 0x73, 0x00
+    ];
+    let s_addr = 
+        find_string_in_rdata(module_base, &str_pattern);
+    if s_addr.is_null() {
+        return 0;
+    }
+    let start_pattern: [u8;3] = [0x4C, 0x8D, 0x05];
+    let xref_addr = 
+        find_xref_in_text(module_base, &start_pattern, 7, s_addr as usize);
+    let call_code: [u8;1] = [0xE8];
+    let call_drp_log_internal_addr = boyer_moore(
+        xref_addr as _, 0x30, &call_code, call_code.len());
+    if call_drp_log_internal_addr.eq(&-1) {
+        return 0;
+    }
+    let call_drp_log_internal_addr = call_drp_log_internal_addr as usize + xref_addr as usize;
+    let call_ldr_allocate_tls_entry = boyer_moore(
+        (call_drp_log_internal_addr + 5) as _, 0x30, &call_code, call_code.len());
+    // let call_ldr_allocate_tls_entry = boyer_moore(
+    //     (call_drp_log_internal_addr + 5) as _, 0x30, call_code.as_ptr(), call_code.len());
+    if call_ldr_allocate_tls_entry.eq(&-1) {
+        return 0;
+    }
+    let call_ldr_allocate_tls_entry = boyer_moore(
+        (call_drp_log_internal_addr + 5) as _, 
+        0x30, 
+        &call_code,
+        call_code.len()
+    );
+
+    // let call_ldr_allocate_tls_entry = boyer_moore(
+    //     (call_drp_log_internal_addr + 5) as _, 
+    //     0x30, 
+    //     call_code.as_ptr(), call_code.len());
+    if call_ldr_allocate_tls_entry.eq(&-1) {
+        return 0;
+    }
+    let call_ldr_allocate_tls_entry = 
+        call_ldr_allocate_tls_entry as usize + call_drp_log_internal_addr + 5;
+    let ldr_allocate_tls_entry = call_ldr_allocate_tls_entry + 
+    calc_call_rva(call_ldr_allocate_tls_entry as _) as usize;
+    let black_list: [usize; 1] = [call_ldr_allocate_tls_entry];
+    let call_ldr_allocate_tls_entry2 = 
+        find_call_rva_in_text(module_base, ldr_allocate_tls_entry, &black_list);
+    if call_ldr_allocate_tls_entry2.eq(&0) {
+        return 0;
+    }
+
+    find_func_start(module_base, call_ldr_allocate_tls_entry2)
+    
+}
+
+unsafe fn find_string_in_rdata(
+    module_base: *const c_void, 
+    pattern: &[u8]
+) -> *const c_void {
+    let rdata_pattern: [u8; 6] = [0x2E, 0x72, 0x64, 0x61, 0x74, 0x61];
+    let (rdata, rdata_size) = get_section_range(module_base, &rdata_pattern);
+    if rdata.is_null() || rdata_size.eq(&0) {
+        return null();
+    }
+    let rdata = rdata as *const u8;
+    let addr = boyer_moore(rdata, rdata_size, pattern, pattern.len());
+    // let addr = boyer_moore(rdata, rdata_size, pattern.as_ptr(), pattern.len());
+    if addr.eq(&-1) {
+        return null();
+    }
+    let addr = rdata.offset(addr) as _;
+    return pointer_sub(addr, module_base as _);
+}
+
+unsafe fn get_text_range(module_base: *const c_void) -> (*const c_void, usize) {
+    let text_pattern: [u8; 5] = [0x2E, 0x74, 0x65, 0x78, 0x74];
+    get_section_range(module_base, &text_pattern)
+}
+
+unsafe fn find_func_start(
+    module_base: *const c_void, 
+    call_addr: usize
+) -> usize {
+    let (text, text_size) = get_text_range(module_base);
+    if text.is_null() || text_size.eq(&0) {
+        return 0;
+    }
+    let start_addr = text as *const u16;
+    let end_addr = (text as usize + text_size) as *const u16;
+    let mut ptr = call_addr as *const u16;
+    if ptr.ge(&end_addr) {
+        return 0;
+    }
+
+    loop {
+        let data = core::ptr::read_unaligned(ptr);
+        if data.eq(&0xCCCC) || data.eq(&0x9090) {
+            return ptr as usize + 2;
+        }
+        ptr = ptr.sub(1);
+        if ptr.le(&start_addr) {
+            return 0;
+        }
+    }
+}
+
+unsafe fn find_xref_in_text(
+    module_base: *const c_void,
+    start_pattern: &[u8], 
+    op_code_len: usize, 
+    xref: usize
+) -> usize {
+    let (text, text_size) = get_text_range(module_base);
+    if text.is_null() || text_size.eq(&0) {
+        return 0;
+    }
+    if start_pattern.len().gt(&12) {
+        return 0;
+    }
+    let mut start_addr = text as *const u8;
+    let mut size = text_size;
+    let xref_addr = module_base as usize + xref;
+    let mut new_pattern: [u8; 16] = 
+        core::mem::MaybeUninit::uninit().assume_init();
+    srdi_memset(&mut new_pattern as *mut _ as _, 0, 16);
+    srdi_memcpy(
+        new_pattern.as_mut_ptr() as _,
+        start_pattern.as_ptr() as _, 
+        start_pattern.len()
+    );
+    let xref_op = 
+        pointer_add(new_pattern.as_ptr() as _, start_pattern.len());
+    let left_len = 16 - start_pattern.len();
+    loop {
+        let offset = boyer_moore(start_addr, size, &start_pattern, start_pattern.len());
+        if offset.eq(&-1) {
+            return 0;
+        }
+        let rv_offset = (
+            xref_addr - (start_addr as usize + offset as usize) - op_code_len
+        ) as i32;
+        let rv_offset_bytes = rv_offset.to_le_bytes();
+        srdi_memset(xref_op as _, 0, left_len);
+        srdi_memcpy(
+            xref_op as _, 
+            rv_offset_bytes.as_ptr() as _, 
+            rv_offset_bytes.len()
+        );
+        let new_len = start_pattern.len() + rv_offset_bytes.len();
+        let new_offset = boyer_moore(
+            start_addr.offset(offset), 
+            new_pattern.len(),
+            &new_pattern,
+            new_len,
+        );
+        // let new_offset = boyer_moore(
+        //     start_addr.offset(offset), 
+        //     new_len, 
+        //     new_pattern.as_ptr() as _,
+        //     new_pattern.len()
+        // );
+        if new_offset.eq(&-1) {
+            let offset = offset as usize + op_code_len;
+            start_addr = start_addr.add(offset);
+            if start_addr.gt(&(text as *const u8).add(text_size)) {
+                return 0;
+            } else if size.le(&offset) {
+                return 0;
+            }
+            size = size - offset;
+            continue;
+        }
+        return start_addr.offset(offset) as usize - module_base as usize;
+    }
+}
+
+unsafe fn find_call_rva_in_text(
+    module_base: *const c_void,
+    func_addr: usize,
+    black_list: &[usize]
+) -> usize {
+    let (text, text_size) = get_text_range(module_base);
+    if text.is_null() || text_size.eq(&0) {
+        return 0;
+    }
+
+    let mut start_addr = text as *const u8;
+    let mut size = text_size;
+    let call_patt = [0xE8];
+    loop {
+        // let offset = boyer_moore(start_addr, size, call_patt.as_ptr(), call_patt.len());
+        let offset = boyer_moore(start_addr, size, &call_patt, call_patt.len());
+        if offset.eq(&-1) {
+            return 0;
+        }
+        let call_addr = start_addr as isize + offset;
+        let rva = (func_addr as isize - call_addr as isize) as i32;
+        let current_rva = calc_call_rva(start_addr as usize + offset as usize);
+        if current_rva.eq(&rva) && !black_list.contains(&(call_addr as usize)) {
+            return start_addr as usize + offset as usize;
+        }
+        let offset = offset + 1;
+        start_addr = start_addr.offset(offset);
+        if start_addr.gt(&(text as *const u8).add(text_size)) {
+            return 0;
+        } else if size.le(&(offset as _)) {
+            return 0;
+        }
+        size = size - offset as usize;
+        continue;
+    }
+}
+
+unsafe fn calc_call_rva(start_addr: usize) -> i32 {
+    let addr = (start_addr + 1) as *const i32;
+    let call_addr = core::ptr::read_unaligned(addr);
+    return call_addr + 5;
+ }
+
+unsafe fn search(
+    begin: *const c_void, 
+    end: *const c_void, 
+    pattern: &[u8]
+) -> *const c_void {
+    let start = begin as *const u8;
+    let finish = end as *const u8;
+    let pattern_len = pattern.len();
+    let mut current = start;
+    while current <= finish.sub(1) {
+        if current.add(pattern_len - 1) > finish {
+            break; 
+        }
+        if core::ptr::eq(
+            core::slice::from_raw_parts(current, pattern_len).as_ptr(),
+            pattern.as_ptr(),
+        ) {
+            return current as *const _;
+        }
+            current = current.add(1);
+    }
+        core::ptr::null()
+}
+
+#[no_mangle]
+extern "C" fn memcpy(
+    dest: *mut c_void, 
+    src: *const c_void, 
+    size: usize
+) -> *mut c_void {
+    unsafe {
+        srdi_memcpy(dest as _, src as _, size);
+    }
+    dest
+}
+
+#[no_mangle]
+extern "C" fn memcmp(
+    dest: *const c_void, 
+    src: *const c_void, 
+    size: usize
+) -> i32 {
+    unsafe {
+        srdi_memcmp(dest as _, src as _, size)
+    }
+}
+
+unsafe fn get_ldrp_handle_tls_offset_data(win_ver: &WinVer) -> (&[u8], usize) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if IsWindows10RS3OrGreater(win_ver) {
+            let mut offset = 0x43;
+            if IsWindows1019H1OrGreater(win_ver) {
+                offset = 0x46;
+            } else if IsWindows10RS4OrGreater(win_ver) {
+                offset = 0x44;
+            }
+        //     return (b"\x74\x33\x44\x8d\x43\x09", offset);
+        // } else if IsWindows10RS2OrGreater(win_ver) {
+        //     return (b"\x74\x33\x44\x8d\x43\x09", 0x43);
+        // } else if IsWindows8Point1OrGreater(win_ver) {
+        //     return (b"\x44\x8d\x43\x09\x4c\x8d\x4c\x24\x38", 0x43);
+        // } else if IsWindows8OrGreater(win_ver) {
+        //     return (b"\x48\x8b\x79\x30\x45\x8d\x66\x01", 0x49);
+        // } else if IsWindows7OrGreater(win_ver) {
+        //     let update1 = win_ver.rversion.gt(&24059);
+        //     let code = b"\x41\xb8\x09\x00\x00\x00\x48\x8d\x44\x24\x38";
+        //     return (code, if update1 { 0x23 } else { 0x27 });
+        }
+    }
+    #[cfg(target_arch = "x86")]
+    {
+        if IsWindows10RS3OrGreater(win_ver) {
+            let mut pattern = b"\x8b\xc1\x8d\x4d\xbc\x51";
+            if IsWindows10RS5OrGreater(win_ver) {
+                pattern = b"\x33\xf6\x85\xc0\x79\x03";
+            } else if IsWindows10RS4OrGreater(win_ver) {
+                pattern = b"\x8b\xc1\x8d\x4d\xac\x51";
+            }
+            let mut offset = 0x18;
+            if IsWindows1020H1OrGreater(win_ver) {
+                offset = 0x2C;
+            } else if IsWindows1019H1OrGreater(win_ver) {
+                offset = 0x2E;
+            } else if IsWindows10RS5OrGreater(win_ver) {
+                offset = 0x2C;
+            }
+            return (pattern, offset);
+        } else if IsWindows10RS2OrGreater(win_ver) {
+            return (b"\x8b\xc1\x8d\x4d\xbc\x51", 0x18);
+        } else if IsWindows8Point1OrGreater() {
+            return (b"\x50\x6a\x09\x6a\x01\x8b\xc1", 0x1B);
+        } else if IsWindows8OrGreater() {
+            return (b"\x8b\x45\x08\x89\x45\xa0", 0xC);
+        } else if IsWindows7OrGreater() {
+            return (b"\x74\x20\x8d\x45\xd4\x50\x6a\x09", 0x14);
+        }
+    }
+    return (&[0;0], 0)
+}
