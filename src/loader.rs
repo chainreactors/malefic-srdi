@@ -7,9 +7,9 @@ use core:: {
 
 use crate::{types::{
     BuildThreshold, DllMain, GetProcAddress, LdrpHandleTlsData, LoadLibraryA, NtFlushInstructionCache, RtlAddFunctionTable, RtlGetVersion, VerShort, VirtualAlloc, VirtualProtect, WinVer, BASE_RELOCATION_BLOCK, BASE_RELOCATION_ENTRY, IMAGE_ORDINAL, IMAGE_RUNTIME_FUNCTION_ENTRY, OSVERSIONINFOEXW, WIN32_WIN_NT_WIN10, WIN32_WIN_NT_WIN7, WIN32_WIN_NT_WIN8, WIN32_WIN_NT_WINBLUE, WIN32_WIN_NT_WINXP
-}, utils::srdi_memcmp};
+}, utils::{srdi_memcmp, IsWindows1020H1OrGreater}};
 
-use crate::utils::{boyer_moore, dbj2_str_hash, get_cstr_len, pointer_add, pointer_sub, srdi_memcpy, srdi_memset, IsWindows1019H1OrGreater, IsWindows10RS2OrGreater, IsWindows10RS3OrGreater, IsWindows10RS4OrGreater, IsWindows11BetaOrGreater, IsWindows7OrGreater, IsWindows8OrGreater, IsWindows8Point1OrGreater};
+use crate::utils::{boyer_moore, dbj2_str_hash, get_cstr_len, pointer_add, pointer_sub, srdi_memcpy, srdi_memset, IsWindows1019H1OrGreater, IsWindows10RS2OrGreater, IsWindows10RS3OrGreater, IsWindows10RS4OrGreater, IsWindows10RS5OrGreater, IsWindows11BetaOrGreater, IsWindows7OrGreater, IsWindows8OrGreater, IsWindows8Point1OrGreater};
 use winapi::um::winnt::{IMAGE_BASE_RELOCATION, IMAGE_DELAYLOAD_DESCRIPTOR, IMAGE_DOS_HEADER, IMAGE_DOS_SIGNATURE, IMAGE_EXPORT_DIRECTORY, IMAGE_IMPORT_BY_NAME, IMAGE_IMPORT_DESCRIPTOR, IMAGE_NT_SIGNATURE, IMAGE_ORDINAL_FLAG, IMAGE_SCN_MEM_EXECUTE, IMAGE_SCN_MEM_READ, IMAGE_SCN_MEM_WRITE, IMAGE_SECTION_HEADER, IMAGE_THUNK_DATA, IMAGE_TLS_DIRECTORY, MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY, PAGE_READONLY, PAGE_READWRITE, PAGE_WRITECOPY};
 use windows_sys::Win32::System::{Threading::{PEB, PEB_LDR_DATA}, WindowsProgramming::LDR_DATA_TABLE_ENTRY};
 
@@ -339,13 +339,27 @@ pub unsafe fn loader(dll: *const c_void) {
 pub static _fltused: i32 = 0;
 
 #[inline]
+#[cfg(target_arch = "x86_64")]
 fn IMAGE_SNAP_BY_ORDINAL(ordinal: &u64) -> bool {
     (ordinal & IMAGE_ORDINAL_FLAG) != 0
 }
 
 #[inline]
+#[cfg(target_arch = "x86_64")]
 fn IMAGE_ORDINAL_FUNC(odrinal: &u64) -> usize {
     (odrinal & (IMAGE_ORDINAL as u64)) as _
+}
+
+#[inline]
+#[cfg(target_arch = "x86")]
+fn IMAGE_SNAP_BY_ORDINAL(ordinal: &u32) -> bool {
+    (ordinal & IMAGE_ORDINAL_FLAG) != 0
+}
+
+#[inline]
+#[cfg(target_arch = "x86")]
+fn IMAGE_ORDINAL_FUNC(odrinal: &u32) -> usize {
+    (odrinal & (IMAGE_ORDINAL as u32)) as _
 }
 
 #[inline]
@@ -622,27 +636,35 @@ pub unsafe fn find_ldrp_handle_tls_greator_win11(
             0x69, 0x74, 0x69, 0x61, 0x6C, 0x69, 
             0x7A, 0x65, 0x54, 0x6C, 0x73, 0x00
         ];
-        let rdata_pattern: [u8; 6] = [0x2E, 0x72, 0x64, 0x61, 0x74, 0x61];
-        let (rdata, rdata_size) = get_section_range(ntdll, &rdata_pattern);
-        if rdata.is_null() || rdata_size.eq(&0) {
-            break;
+        let s_addr;
+        #[cfg(target_arch = "x86_64")]
+        {
+            s_addr = find_string_in_rdata(ntdll, &str_pattern);
         }
-        let rdata = rdata as *const u8;
-        let addr = boyer_moore(rdata, rdata_size, &str_pattern, str_pattern.len());
-        if addr.eq(&-1) {
-            break;
-        }
-        let addr = rdata.offset(addr) as _;
-        let s_addr  = pointer_sub(addr, ntdll as _);
-        if s_addr.is_null() {
-            break;
+        #[cfg(target_arch = "x86")]
+        {
+            s_addr = find_string_in_text(ntdll, &str_pattern);
         }
     
-        let start_pattern: [u8;3] = [0x4C, 0x8D, 0x05];
-        let xref_addr = 
-            find_xref_in_text(ntdll, &start_pattern, 7, s_addr as usize);
-        if xref_addr.eq(&0) {
-            break;
+        let xref_addr;
+        #[cfg(target_arch = "x86_64")]
+        {
+            let start_pattern: [u8;3] = [0x4C, 0x8D, 0x05];
+            xref_addr = 
+                find_xref_in_text(ntdll, &start_pattern, 7, s_addr as usize);
+            if xref_addr.eq(&0) {
+                break;
+            }
+        }
+        #[cfg(target_arch = "x86")]
+        {
+            let start_pattern: [u8;1] = [0x68];
+            xref_addr = find_xref_in_text_without_rva(
+                ntdll, &start_pattern, 5, s_addr as usize
+            );
+            if xref_addr.eq(&0) {
+                break;
+            }
         }
         let xref_addr = xref_addr as usize + ntdll as usize;
         let call_code: [u8;1] = [0xE8];
@@ -652,30 +674,31 @@ pub unsafe fn find_ldrp_handle_tls_greator_win11(
             break;
         }
         let call_drp_log_internal_addr = 
-                    call_drp_log_internal_addr as usize + xref_addr as usize;
-                let call_ldr_allocate_tls_entry = boyer_moore(
-                    (call_drp_log_internal_addr + 5) as _, 0x30, &call_code, call_code.len());
-                if call_ldr_allocate_tls_entry.eq(&-1) {
-                    break;
-                }
-                let call_ldr_allocate_tls_entry = 
-                    call_ldr_allocate_tls_entry as usize + 
-                    call_drp_log_internal_addr + 5;
+            call_drp_log_internal_addr as usize + xref_addr as usize;
+        let call_ldr_allocate_tls_entry = boyer_moore(
+            (call_drp_log_internal_addr + 5) as _, 0x30, &call_code, call_code.len());
+        if call_ldr_allocate_tls_entry.eq(&-1) {
+            break;
+        }
+        let call_ldr_allocate_tls_entry = 
+            call_ldr_allocate_tls_entry as usize + 
+            call_drp_log_internal_addr + 5;
     
-                let ldr_allocate_tls_entry = call_ldr_allocate_tls_entry + 
-                calc_call_rva(call_ldr_allocate_tls_entry as _) as usize;
-                let black_list: [usize; 1] = [call_ldr_allocate_tls_entry];
-                let call_ldr_allocate_tls_entry2 = 
-                    find_call_rva_in_text(ntdll, ldr_allocate_tls_entry, &black_list);
-                if call_ldr_allocate_tls_entry2.eq(&0) {
-                    break;
-                }
+        let ldr_allocate_tls_entry = call_ldr_allocate_tls_entry.wrapping_add(
+            calc_call_rva(call_ldr_allocate_tls_entry as _) as _);
+        let black_list: [usize; 1] = [call_ldr_allocate_tls_entry];
+        let call_ldr_allocate_tls_entry2 = 
+            find_call_rva_in_text(ntdll, ldr_allocate_tls_entry, &black_list);
+        if call_ldr_allocate_tls_entry2.eq(&0) {
+            break;
+        }
     
         return find_func_start(ntdll, call_ldr_allocate_tls_entry2);
     }
     0
 }
 
+#[cfg(target_arch = "x86_64")]
 #[no_mangle]
 unsafe fn find_string_in_rdata(
     module_base: *const c_void, 
@@ -688,12 +711,45 @@ unsafe fn find_string_in_rdata(
     }
     let rdata = rdata as *const u8;
     let addr = boyer_moore(rdata, rdata_size, pattern, pattern.len());
-    // let addr = boyer_moore(rdata, rdata_size, pattern.as_ptr(), pattern.len());
     if addr.eq(&-1) {
         return null();
     }
     let addr = rdata.offset(addr) as _;
     return pointer_sub(addr, module_base as _);
+}
+
+#[cfg(target_arch = "x86")]
+#[no_mangle]
+unsafe fn find_string_in_text(
+    module_base: *const c_void, 
+    pattern: &[u8]
+) -> *const c_void {
+    let (text, text_size) = get_text_range(module_base);
+    if text.is_null() || text_size.eq(&0) {
+        return null();
+    }
+    let text = text as *const u8;
+    let addr = boyer_moore(text, text_size, pattern, pattern.len());
+    if addr.eq(&-1) {
+        return null();
+    }
+    let dos_headers = module_base as *mut IMAGE_DOS_HEADER;
+    if (*dos_headers).e_magic.ne(&IMAGE_DOS_SIGNATURE) {
+        return null();
+    }
+
+    let nt_headers = get_nt_header!(module_base);
+    if (*nt_headers).Signature.ne(&IMAGE_NT_SIGNATURE) {
+        return null();
+    }
+
+    let file_header = &(*nt_headers).FileHeader;
+    let option_header = &(*nt_headers).OptionalHeader;
+    let addr = text.add(addr as _);
+    return (addr as usize + 
+        (text as usize - module_base as usize 
+        - (*option_header).BaseOfCode as usize))
+        as *const core::ffi::c_void;
 }
 
 unsafe fn get_text_range(module_base: *const c_void) -> (*const c_void, usize) {
@@ -728,6 +784,7 @@ unsafe fn find_func_start(
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 #[no_mangle]
 unsafe fn find_xref_in_text(
     module_base: *const c_void,
@@ -792,6 +849,44 @@ unsafe fn find_xref_in_text(
         return start_addr.offset(offset) as usize - module_base as usize;
     }
 }
+
+
+#[cfg(target_arch = "x86")]
+#[no_mangle]
+unsafe fn find_xref_in_text_without_rva(
+    module_base: *const c_void,
+    start_pattern: &[u8], 
+    op_code_len: usize, 
+    xref: usize
+) -> usize {
+    let (text, text_size) = get_text_range(module_base);
+    if text.is_null() || text_size.eq(&0) {
+        return 0;
+    }
+    if start_pattern.len().gt(&12) {
+        return 0;
+    }
+    let mut new_pattern: [u8; 16] = 
+        core::mem::MaybeUninit::uninit().assume_init();
+    srdi_memset(&mut new_pattern as *mut _ as _, 0, 16);
+    srdi_memcpy(
+        new_pattern.as_mut_ptr() as _,
+        start_pattern.as_ptr() as _, 
+        start_pattern.len()
+    );
+    let xref = (xref as i32).to_le_bytes();
+    srdi_memcpy(
+        new_pattern.as_mut_ptr().add(start_pattern.len()) as _,
+        xref.as_ptr() as _,
+        xref.len()
+    );
+    let offset = boyer_moore(text as _, text_size, &new_pattern, op_code_len);
+    if offset.eq(&-1) {
+        return 0;
+    }
+    return text.offset(offset) as usize - module_base as usize;
+}
+
 
 #[no_mangle]
 unsafe fn find_call_rva_in_text(
@@ -861,12 +956,39 @@ extern "C" fn memcmp(
 }
 
 #[no_mangle]
+pub extern "C" fn memmove(dest: *mut u8, src: *const u8, n: usize) -> *mut u8 {
+    if src < dest as *const u8 {
+        for i in (0..n).rev() {
+            unsafe {
+                *dest.add(i) = *src.add(i);
+            }
+        }
+    } else {
+        for i in 0..n {
+            unsafe {
+                *dest.add(i) = *src.add(i);
+            }
+        }
+    }
+    dest
+}
+
+#[no_mangle]
+#[cfg(target_arch = "x86_64")]
 pub extern "system" fn __CxxFrameHandler3(
     _: *mut u8, 
     _: *mut u8, 
     _: *mut u8, 
     _: *mut u8
 ) -> i32 { unimplemented!() }
+
+
+#[no_mangle]
+#[cfg(target_arch = "x86")]
+#[no_mangle]
+unsafe extern "C" fn __CxxFrameHandler3() {
+	unreachable!()
+}
 
 #[repr(C)]
 struct ldrp_handle_tls_search {
@@ -977,7 +1099,7 @@ unsafe fn get_ldrp_handle_tls_offset_data(win_ver: &WinVer) -> ldrp_handle_tls_s
             ret_pattern.real_len = pattern.len();
             ret_pattern.offset = 0x18;
             // return (b"\x8b\xc1\x8d\x4d\xbc\x51", 0x18);
-        } else if IsWindows8Point1OrGreater() {
+        } else if IsWindows8Point1OrGreater(win_ver) {
             let pattern = [
                 0x50, 0x6a, 0x09, 0x6a, 0x01, 0x8b, 0xc1
             ];
@@ -985,7 +1107,7 @@ unsafe fn get_ldrp_handle_tls_offset_data(win_ver: &WinVer) -> ldrp_handle_tls_s
             ret_pattern.real_len = pattern.len();
             ret_pattern.offset = 0x1B;
             // return (b"\x50\x6a\x09\x6a\x01\x8b\xc1", 0x1B);
-        } else if IsWindows8OrGreater() {
+        } else if IsWindows8OrGreater(win_ver) {
             let pattern = [
                 0x8b, 0x45, 0x08, 0x89, 0x45, 0xa0
             ];
@@ -993,7 +1115,7 @@ unsafe fn get_ldrp_handle_tls_offset_data(win_ver: &WinVer) -> ldrp_handle_tls_s
             ret_pattern.real_len = pattern.len();
             ret_pattern.offset = 0xC;
             // return (b"\x8b\x45\x08\x89\x45\xa0", 0xC);
-        } else if IsWindows7OrGreater() {
+        } else if IsWindows7OrGreater(win_ver) {
             let pattern = [
                 0x74, 0x20, 0x8d, 0x45, 0xd4, 0x50, 0x6a, 0x09
             ];
