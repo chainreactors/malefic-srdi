@@ -17,6 +17,11 @@ pub mod loader;
 
 
 #[no_mangle]
-pub unsafe extern "C" fn main(module_base: *const core::ffi::c_void) {
-    loader::loader(module_base)
+pub unsafe extern "C" fn main(
+    module_base: *const core::ffi::c_void,
+    entry_func: *const core::ffi::c_void,
+    user_data: *const core::ffi::c_void,
+    user_data_len: usize,
+) {
+    loader::loader(module_base, entry_func, user_data, user_data_len);
 }

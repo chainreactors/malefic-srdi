@@ -6,7 +6,7 @@ use core:: {
 
 
 use crate::{types::{
-    BuildThreshold, DllMain, GetProcAddress, LdrpHandleTlsData, LoadLibraryA, NtFlushInstructionCache, RtlAddFunctionTable, RtlGetVersion, VerShort, VirtualAlloc, VirtualProtect, WinVer, BASE_RELOCATION_BLOCK, BASE_RELOCATION_ENTRY, IMAGE_ORDINAL, IMAGE_RUNTIME_FUNCTION_ENTRY, OSVERSIONINFOEXW, WIN32_WIN_NT_WIN10, WIN32_WIN_NT_WIN7, WIN32_WIN_NT_WIN8, WIN32_WIN_NT_WINBLUE, WIN32_WIN_NT_WINXP
+    BuildThreshold, DllMain, GetProcAddress, LdrpHandleTlsData, LoadLibraryA, NtFlushInstructionCache, RtlAddFunctionTable, RtlGetVersion, VerShort, VirtualAlloc, VirtualProtect, WinVer, BASE_RELOCATION_BLOCK, BASE_RELOCATION_ENTRY, DLL_BEACON_USER_DATA, IMAGE_ORDINAL, IMAGE_RUNTIME_FUNCTION_ENTRY, OSVERSIONINFOEXW, WIN32_WIN_NT_WIN10, WIN32_WIN_NT_WIN7, WIN32_WIN_NT_WIN8, WIN32_WIN_NT_WINBLUE, WIN32_WIN_NT_WINXP
 }, utils::{srdi_memcmp, IsWindows1020H1OrGreater}};
 
 use crate::utils::{boyer_moore, dbj2_str_hash, get_cstr_len, pointer_add, pointer_sub, srdi_memcpy, srdi_memset, IsWindows1019H1OrGreater, IsWindows10RS2OrGreater, IsWindows10RS3OrGreater, IsWindows10RS4OrGreater, IsWindows10RS5OrGreater, IsWindows11BetaOrGreater, IsWindows7OrGreater, IsWindows8OrGreater, IsWindows8Point1OrGreater};
@@ -22,8 +22,12 @@ fn panic(_info: &core::panic::PanicInfo) -> ! {
 
 pub type Main = extern "system" fn();
 
-pub unsafe fn loader(dll: *const c_void) {
-    let module_base = dll;
+pub unsafe fn loader(
+    module_base: *const c_void,
+    entry_func: *const c_void,
+    user_data: *const core::ffi::c_void,
+    user_data_len: usize,
+) {
     let dos_headers = module_base as *mut IMAGE_DOS_HEADER;
     if (*dos_headers).e_magic.ne(&IMAGE_DOS_SIGNATURE) {
         return;
@@ -52,14 +56,12 @@ pub unsafe fn loader(dll: *const c_void) {
     let get_proc_address = get_export_by_hash(kernel32, 0xdecfc1bf);
     let virtual_alloc = get_export_by_hash(kernel32, 0x97bc257);
     let virtual_protect = get_export_by_hash(kernel32, 0xe857500d);
-    let rtl_add_function_table = get_export_by_hash(ntdll, 0x81a887ce);
     let nt_flush_instruction_cache = get_export_by_hash(ntdll, 0x6269b87f);
     let rtl_get_version = get_export_by_hash(ntdll, 0xdde5cdd);
 
     if load_library_a.is_null() || get_proc_address.is_null() ||
         virtual_alloc.is_null() || virtual_protect.is_null()  ||
-        nt_flush_instruction_cache.is_null() || rtl_get_version.is_null() ||
-        rtl_add_function_table.is_null() {
+        nt_flush_instruction_cache.is_null() || rtl_get_version.is_null() {
             return;
     }
 
@@ -67,8 +69,6 @@ pub unsafe fn loader(dll: *const c_void) {
     let get_proc_address: GetProcAddress = transmute(get_proc_address);
     let virtual_alloc: VirtualAlloc = transmute(virtual_alloc);
     let virtual_protect: VirtualProtect = transmute(virtual_protect);
-    let rtl_add_function_table: RtlAddFunctionTable = 
-        transmute(rtl_add_function_table);
 
     let nt_flush_instruction_cache: NtFlushInstructionCache = 
         transmute(nt_flush_instruction_cache);
@@ -314,24 +314,49 @@ pub unsafe fn loader(dll: *const c_void) {
         }
     }
 
-    let exception_dir = &option_header.DataDirectory[3];
-    if exception_dir.Size.gt(&0) {
-        let rf_entry = pointer_add(
-            virtual_base_address, 
-            tls_data.VirtualAddress as usize
-        ) as *mut IMAGE_RUNTIME_FUNCTION_ENTRY;
-        let _  = rtl_add_function_table(
-            rf_entry,
-            (exception_dir.Size / 
-                size_of::<IMAGE_RUNTIME_FUNCTION_ENTRY>() as u32) - 1, 
-            virtual_base_address as _);
+    #[cfg(target_arch = "x86_64")]
+    {
+        let rtl_add_function_table = get_export_by_hash(kernel32, 0x81a887ce);
+        if rtl_add_function_table.is_null() {
+            return;
+        }
+        let rtl_add_function_table: RtlAddFunctionTable = 
+            transmute(rtl_add_function_table);
+        let exception_dir = &option_header.DataDirectory[3];
+        if exception_dir.Size.gt(&0) {
+            let rf_entry = pointer_add(
+                virtual_base_address, 
+                tls_data.VirtualAddress as usize
+            ) as *mut IMAGE_RUNTIME_FUNCTION_ENTRY;
+            let _  = rtl_add_function_table(
+                rf_entry,
+                (exception_dir.Size / 
+                    size_of::<IMAGE_RUNTIME_FUNCTION_ENTRY>() as u32) - 1, 
+                virtual_base_address as _);
+        }
     }
 
     let entrypoint = pointer_add(
         virtual_base_address, 
         option_header.AddressOfEntryPoint as _
     );
-    transmute::<usize, DllMain>(entrypoint as _)(0 as _, 1, 0 as _);
+    let user_data_ptr = virtual_alloc(
+        0 as _, 
+        user_data_len, 
+        MEM_COMMIT | MEM_RESERVE, 
+        PAGE_READWRITE
+    );
+    srdi_memcpy(user_data_ptr as _, user_data as _, user_data_len);
+    if entry_func.is_null() {
+        // EXE maybe
+        transmute::<usize, DllMain>(entrypoint as _)(0 as _, 1, 0 as _);
+        return;
+    }
+    transmute::<usize, DllMain>(entrypoint as _)(
+        0 as _, DLL_BEACON_USER_DATA, user_data_ptr as _
+    );
+    let entry_func = pointer_add(virtual_base_address, entry_func as _);
+    transmute::<*const core::ffi::c_void, Main>(entry_func);
 }
 
 #[used]
@@ -594,9 +619,24 @@ unsafe fn LdrpHandleTlsData(
         core::mem::size_of::<LDR_DATA_TABLE_ENTRY>()
     );
     ldr_data_table_entry.DllBase = hmodule;
-    transmute::<*const c_void, LdrpHandleTlsData>(ldrp_handle_tls)(
-        &mut ldr_data_table_entry as *mut _ as _
-    )
+    #[cfg(target_arch = "x86_64")]
+    {
+        transmute::<*const c_void, crate::types::LdrpHandleTlsData>(ldrp_handle_tls)( 
+            &mut ldr_data_table_entry as *mut _ as _
+        )
+    }
+    #[cfg(target_arch = "x86")]
+    {
+        if IsWindows8Point1OrGreater(win_ver) {
+            transmute::<*const c_void, crate::types::LdrpHandleTlsDataWin8Point1OrGreater>(ldrp_handle_tls)( 
+                &mut ldr_data_table_entry as *mut _ as _
+            )
+        } else {
+            transmute::<*const c_void, crate::types::LdrpHandleTlsDataOther>(ldrp_handle_tls)(
+                &mut ldr_data_table_entry as *mut _ as _
+            )
+        }
+    }
 }
 
 #[no_mangle]
@@ -775,7 +815,12 @@ unsafe fn find_func_start(
     loop {
         let data = core::ptr::read_unaligned(ptr);
         if data.eq(&0xCCCC) || data.eq(&0x9090) {
-            return ptr as usize + 2;
+            let ptr = ptr as *const u8;
+            let ptr = ptr.add(2);
+            if read_unaligned(ptr).eq(&0xcc) || read_unaligned(ptr).eq(&0x90) {
+                return ptr as usize + 1;
+            }
+            return ptr as usize;
         }
         ptr = ptr.sub(1);
         if ptr.le(&start_addr) {

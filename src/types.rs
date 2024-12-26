@@ -1,7 +1,12 @@
 // use windows_sys::Win32::System::Diagnostics::Debug::IMAGE_RUNTIME_FUNCTION_ENTRY;
 
-pub type DllMain = unsafe extern "system" fn(*mut core::ffi::c_void, u32, *mut core::ffi::c_void) -> i32;
+pub type DllMain = unsafe extern "system" fn(
+    *mut core::ffi::c_void,
+    u32,
+    *mut core::ffi::c_void
+) -> i32;
 pub const IMAGE_ORDINAL: usize = 0xffff;
+pub const DLL_BEACON_USER_DATA: u32 = 0x0du32;
 
 #[repr(C)]
 pub struct BASE_RELOCATION_BLOCK {
@@ -116,6 +121,14 @@ pub type VirtualProtect = unsafe extern "system" fn(
 ) -> i32;
 
 pub type LdrpHandleTlsData = unsafe extern "system" fn(
+    hmodule: *mut ::core::ffi::c_void,
+) -> i32;
+
+pub type LdrpHandleTlsDataWin8Point1OrGreater = unsafe extern "thiscall" fn(
+    hmodule: *mut ::core::ffi::c_void,
+) -> i32;
+
+pub type LdrpHandleTlsDataOther = unsafe extern "stdcall" fn(
     hmodule: *mut ::core::ffi::c_void,
 ) -> i32;
 
