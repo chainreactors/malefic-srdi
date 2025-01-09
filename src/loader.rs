@@ -619,24 +619,33 @@ unsafe fn LdrpHandleTlsData(
         core::mem::size_of::<LDR_DATA_TABLE_ENTRY>()
     );
     ldr_data_table_entry.DllBase = hmodule;
-    #[cfg(target_arch = "x86_64")]
-    {
-        transmute::<*const c_void, crate::types::LdrpHandleTlsData>(ldrp_handle_tls)( 
+    if IsWindows8Point1OrGreater(win_ver) {
+        transmute::<*const c_void, crate::types::LdrpHandleTlsDataWin8Point1OrGreater>(ldrp_handle_tls)( 
+            &mut ldr_data_table_entry as *mut _ as _
+        )
+    } else {
+        transmute::<*const c_void, crate::types::LdrpHandleTlsDataOther>(ldrp_handle_tls)(
             &mut ldr_data_table_entry as *mut _ as _
         )
     }
-    #[cfg(target_arch = "x86")]
-    {
-        if IsWindows8Point1OrGreater(win_ver) {
-            transmute::<*const c_void, crate::types::LdrpHandleTlsDataWin8Point1OrGreater>(ldrp_handle_tls)( 
-                &mut ldr_data_table_entry as *mut _ as _
-            )
-        } else {
-            transmute::<*const c_void, crate::types::LdrpHandleTlsDataOther>(ldrp_handle_tls)(
-                &mut ldr_data_table_entry as *mut _ as _
-            )
-        }
-    }
+    // #[cfg(target_arch = "x86_64")]
+    // {
+    //     transmute::<*const c_void, crate::types::LdrpHandleTlsData>(ldrp_handle_tls)( 
+    //         &mut ldr_data_table_entry as *mut _ as _
+    //     )
+    // }
+    // #[cfg(target_arch = "x86")]
+    // {
+    //     if IsWindows8Point1OrGreater(win_ver) {
+    //         transmute::<*const c_void, crate::types::LdrpHandleTlsDataWin8Point1OrGreater>(ldrp_handle_tls)( 
+    //             &mut ldr_data_table_entry as *mut _ as _
+    //         )
+    //     } else {
+    //         transmute::<*const c_void, crate::types::LdrpHandleTlsDataOther>(ldrp_handle_tls)(
+    //             &mut ldr_data_table_entry as *mut _ as _
+    //         )
+    //     }
+    // }
 }
 
 #[no_mangle]
@@ -663,7 +672,20 @@ unsafe fn search_ldrp_handle_tls(
         return null();
     }
     let addr = (offset as usize + section as usize) as *const core::ffi::c_void;
-    return pointer_sub(addr, handle.offset);
+    return check_real_start(pointer_sub(addr, handle.offset));
+}
+
+#[no_mangle]
+unsafe fn check_real_start(call_addr: *const c_void) -> *const c_void {
+    let mut real_start = call_addr as *const u8;
+    loop {
+        let data = read_unaligned(real_start);
+        if data.ne(&0xcc) && data.ne(&0x90) {
+            break;
+        }
+        real_start = real_start.add(1);
+    }
+    real_start as _
 }
 
 #[no_mangle]
@@ -1088,15 +1110,12 @@ unsafe fn get_ldrp_handle_tls_offset_data(win_ver: &WinVer) -> ldrp_handle_tls_s
             ret_pattern.offset = 0x49;
             // return (b"\x48\x8b\x79\x30\x45\x8d\x66\x01", 0x49);
         } else if IsWindows7OrGreater(win_ver) {
-            let update1 = win_ver.rversion.gt(&24059);
             let pattern = [
                 0x41, 0xB8, 0x09, 0x00, 0x00, 0x00, 0x48, 0x8D, 0x44, 0x24, 0x38
             ];
             srdi_memcpy(ret_pattern.pattern.as_mut_ptr(), pattern.as_ptr(), pattern.len());
             ret_pattern.real_len = pattern.len();
-            ret_pattern.offset = if update1 { 0x23 } else { 0x27 };
-            // let code = b"\x41\xb8\x09\x00\x00\x00\x48\x8d\x44\x24\x38";
-            // return (code, if update1 { 0x23 } else { 0x27 });
+            ret_pattern.offset = 0x27;
         }
     }
     #[cfg(target_arch = "x86")]
